@@ -20,13 +20,23 @@ import os
 import re
 import time
 import urllib2
+import deploy_settings
 
 from datetime import date, timedelta, datetime
+from twilio.rest import TwilioRestClient
 
 LOG_OUTPUT_DIR = 'tweet_logs/'
+SUBSCRIPTIONS_FILENAME = 'subscriptions.json'
+
 DELAYED_KEYWORDS = ['late', 'delayed', 'delay', 'delays']
 THIRTY_MINUTES_IN_SEC = 30 * 60
 FIFTEEN_MINUTES_IN_SEC = 15 * 60
+
+MINIMUM_NUM_TWEETS = 20
+DELAY_PERCENTAGE = 40
+
+TWILIO_CLIENT = TwilioRestClient(deploy_settings.ACCOUNT_SID,
+                                 deploy_settings.AUTH_TOKEN)
 
 def _doesTweetContainKeywords(tweet, keywords):
   """Checks the tweet against a list of keywords.
@@ -76,7 +86,24 @@ def _writeOutData(recent_tweet_counts, delayed_tweet_counts, delayed_tweets):
     f.write("\n")
   f.close()
 
-def pollTwitterForDelays(last_poll_tweet_id = -1):
+def _getNotification(recent_tweet_counts, delayed_tweet_counts,
+                     delayed_tweets):
+  delayed_tweet_percentage = int(100 * delayed_tweet_counts/recent_tweet_counts)
+  return ("There have been %s caltrain tweets in the past half hour,"
+          " and %s%% are about delays.") % (recent_tweet_counts,
+                                            delayed_tweet_percentage)
+
+def _shouldSendTexts(recent_tweet_counts, delayed_tweet_counts):
+  delayed_tweet_percentage = int(100 * delayed_tweet_counts/recent_tweet_counts)
+  return recent_tweet_counts >= MINIMUM_NUM_TWEETS and \
+         delayed_tweet_percentage >= DELAY_PERCENTAGE
+
+def _sendTextMessages(subscriptions, message):
+  for number in subscriptions:
+    sms_text = TWILIO_CLIENT.sms.messages.create(to=number,
+        from_=deploy_settings.TWILIO_NUMBER, body=message)
+
+def pollTwitterForDelays(last_poll_tweet_id=-1, subscriptions=[]):
   """Polls twitter for search results, filters the results and writes it
   out to logs.
   """
@@ -109,13 +136,28 @@ def pollTwitterForDelays(last_poll_tweet_id = -1):
   if delayed_tweet_counts:
     print "Found some delay tweets."
     _writeOutData(recent_tweet_counts, delayed_tweet_counts, delayed_tweets)
+    if _shouldSendTexts(recent_tweet_counts, delayed_tweet_counts):
+      print "Sending %s texts..." % len(subscriptions)
+      message = _getNotification(recent_tweet_counts,
+                                 delayed_tweet_counts,
+                                 delayed_tweets)
+      _sendTextMessages(subscriptions, message)
   return most_recent_tweet_id
 
+def getSubscriptions():
+  subscriptions = []
+  f = open(SUBSCRIPTIONS_FILENAME, "r")
+  loaded_json = json.load(f)
+  for entry in loaded_json['subscriptions']:
+    subscriptions.append(entry["number"])
+  return subscriptions
 
 most_recent_tweet_id = -1
 while(1):
+  subscriptions = getSubscriptions()
   print "Polling twitter...."
-  most_recent_tweet_id = pollTwitterForDelays(most_recent_tweet_id)
+  most_recent_tweet_id = pollTwitterForDelays(most_recent_tweet_id,
+                                              subscriptions)
   print "...Done polling."
   time.sleep(FIFTEEN_MINUTES_IN_SEC)
 
