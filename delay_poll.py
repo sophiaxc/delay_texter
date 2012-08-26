@@ -25,6 +25,9 @@ import deploy_settings
 from datetime import date, timedelta, datetime
 from twilio.rest import TwilioRestClient
 
+
+TWEET_QUERY = ('http://search.twitter.com/search.json?'
+               'q=caltrain&rpp=100&page=1&result_type=recent')
 LOG_OUTPUT_DIR = 'tweet_logs/'
 SUBSCRIPTIONS_FILENAME = 'subscriptions.json'
 
@@ -107,10 +110,12 @@ def pollTwitterForDelays(last_poll_tweet_id=-1, subscriptions=[]):
   """Polls twitter for search results, filters the results and writes it
   out to logs.
   """
-  url = 'http://search.twitter.com/search.json?q=caltrain&rpp=100&page=1&result_type=recent'
-  response = urllib2.urlopen(url).read()
-  output = json.loads(response)
-  twitter_results = output['results']
+  try:
+    response = urllib2.urlopen(TWEET_QUERY).read()
+    output = json.loads(response)
+    twitter_results = output['results']
+  except:
+    return last_poll_tweet_id
 
   # Check the most recent tweet id of the last time we polled twitter,
   # if the tweet id hasn't changed, don't bother parsing data.
@@ -131,7 +136,7 @@ def pollTwitterForDelays(last_poll_tweet_id=-1, subscriptions=[]):
     if _doesTweetContainKeywords(tweet_text, DELAYED_KEYWORDS):
       if not _isRetweet(tweet_text) and is_tweeted_recently:
         delayed_tweet_counts += 1
-        delayed_tweets.append('%s AT %s' % (tweet_text,tweet['created_at']))
+        delayed_tweets.append('%s AT %s' % (tweet_text, tweet['created_at']))
 
   if delayed_tweet_counts:
     print "Found some delay tweets."
