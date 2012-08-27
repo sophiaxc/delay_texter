@@ -17,101 +17,64 @@ data until a proper threshold for alerts can be determined.
 import codecs
 import json
 import os
-import re
 import time
 import urllib2
 import deploy_settings
 
-from datetime import date, timedelta, datetime
+import filters
+
 from twilio.rest import TwilioRestClient
 
-
-TWEET_QUERY = ('http://search.twitter.com/search.json?'
-               'q=caltrain&rpp=100&page=1&result_type=recent')
-LOG_OUTPUT_DIR = 'tweet_logs/'
-SUBSCRIPTIONS_FILENAME = 'subscriptions.json'
-
-DELAYED_KEYWORDS = ['late', 'delayed', 'delay', 'delays']
-THIRTY_MINUTES_IN_SEC = 30 * 60
 FIFTEEN_MINUTES_IN_SEC = 15 * 60
-
-MINIMUM_NUM_TWEETS = 20
-DELAY_PERCENTAGE = 40
 
 TWILIO_CLIENT = TwilioRestClient(deploy_settings.ACCOUNT_SID,
                                  deploy_settings.AUTH_TOKEN)
 
-def _doesTweetContainKeywords(tweet, keywords):
-  """Checks the tweet against a list of keywords.
-  """
-  tweet_word_list = re.findall(r'\w+', tweet)
-  return any([tweet_word for tweet_word in tweet_word_list
-              if tweet_word in keywords])
-
-def _isRetweet(tweet):
-  """Checks if the first word in a tweet is 'rt', indicating a
-  retweet.
-  """
-  tweet_word_list = re.findall(r'\w+', tweet)
-  return tweet_word_list[0] == 'rt'
-
-def _parseDate(tweet_date):
-  """Parses a tweet time stamp into a datetime object.
-  Date comes in as: "Tue, 15 May 2012 18:05:44 +0000"
-  """
-  tweet_date = tweet_date.split(' ')
-  tweet_date = ' '.join(tweet_date[:-1])
-  return datetime.strptime(tweet_date, '%a, %d %b %Y %H:%M:%S')
-
-def _isTweetInValidTimeRange(tweet, time_range):
-  """Given a tweet JSON object, check the creation
-  date and see if it falls within a recency time window of X seconds.
-  """
-  DAYS_IN_SECONDS = 24 * 60 * 60
-  current_date = datetime.utcnow()
-  tweet_date = _parseDate(tweet['created_at'])
-  date_diff = current_date - tweet_date
-  time_difference = date_diff.days * DAYS_IN_SECONDS
-  time_difference += date_diff.seconds
-  return time_difference <= time_range
-
-def _writeOutData(recent_tweet_counts, delayed_tweet_counts, delayed_tweets):
+def _writeOutData(valid_tweets, delayed_tweets):
   """Write out the total tweet counts, delayed tweet counts, and actual
   delayed tweets.
   """
-  log_file_name = LOG_OUTPUT_DIR + 'delays_%s' % (int(time.time()))
+  if not delayed_tweets:
+    return
+  log_file_name = 'delays_%s' % (int(time.time()))
+  log_path = os.path.join(deploy_settings.LOG_OUTPUT_DIR, log_file_name)
   print "Writing out to %s" % log_file_name
   f = codecs.open(log_file_name, "wb", "utf8")
-  f.write("Total tweets count: %s\n" % recent_tweet_counts)
-  f.write("Delay tweets count: %s\n" % delayed_tweet_counts)
+  f.write("Total tweets count: %s\n" % len(valid_tweets))
+  f.write("Delay tweets count: %s\n" % len(delayed_tweets))
   for tweet in delayed_tweets:
-    f.write(tweet)
+    tweet_details = '%s AT %s' % (tweet['text'], tweet['created_at'])
+    f.write(tweet_details)
     f.write("\n")
   f.close()
 
-def _getNotification(recent_tweet_counts, delayed_tweet_counts,
-                     delayed_tweets):
-  delayed_tweet_percentage = int(100 * delayed_tweet_counts/recent_tweet_counts)
+def _getNotification(valid_tweets, delayed_tweets):
+  valid_tweet_count = len(valid_tweets)
+  delayed_tweet_count = len(delayed_tweets)
+  delayed_tweet_percentage = int(100 * delayed_tweet_count/valid_tweet_count)
   return ("There have been %s caltrain tweets in the past half hour,"
-          " and %s%% are about delays.") % (recent_tweet_counts,
+          " and %s%% are about delays.") % (valid_tweet_count,
                                             delayed_tweet_percentage)
 
-def _shouldSendTexts(recent_tweet_counts, delayed_tweet_counts):
+def _shouldNotify(recent_tweet_counts, delayed_tweet_counts):
   delayed_tweet_percentage = int(100 * delayed_tweet_counts/recent_tweet_counts)
-  return recent_tweet_counts >= MINIMUM_NUM_TWEETS and \
-         delayed_tweet_percentage >= DELAY_PERCENTAGE
+  return recent_tweet_counts >= deploy_settings.MINIMUM_NUM_TWEETS and \
+         delayed_tweet_percentage >= deploy_settings.DELAY_PERCENTAGE
 
 def _sendTextMessages(subscriptions, message):
   for number in subscriptions:
     sms_text = TWILIO_CLIENT.sms.messages.create(to=number,
         from_=deploy_settings.TWILIO_NUMBER, body=message)
 
+def _hasNewUpdates(last_poll_tweet_id, output):
+  return output['max_id'] != last_poll_tweet_id
+
 def pollTwitterForDelays(last_poll_tweet_id=-1, subscriptions=[]):
   """Polls twitter for search results, filters the results and writes it
   out to logs.
   """
   try:
-    response = urllib2.urlopen(TWEET_QUERY).read()
+    response = urllib2.urlopen(deploy_settings.TWEET_QUERY).read()
     output = json.loads(response)
     twitter_results = output['results']
   except:
@@ -119,50 +82,48 @@ def pollTwitterForDelays(last_poll_tweet_id=-1, subscriptions=[]):
 
   # Check the most recent tweet id of the last time we polled twitter,
   # if the tweet id hasn't changed, don't bother parsing data.
-  most_recent_tweet_id = output['max_id']
-  if most_recent_tweet_id == last_poll_tweet_id:
+  if not _hasNewUpdates(last_poll_tweet_id, output):
     print "No updates."
-    return most_recent_tweet_id
+    return last_poll_tweet_id
 
-  recent_tweet_counts = 0
-  delayed_tweet_counts = 0
-  delayed_tweets = []
+  should_send, message = _processTwitterResults(twitter_results)
+  if should_send:
+    print "Sending %s texts..." % len(subscriptions)
+    _sendTextMessages(subscriptions, message)
 
-  for tweet in twitter_results:
-    tweet_text = tweet['text'].lower()
-    is_tweeted_recently = \
-        _isTweetInValidTimeRange(tweet, THIRTY_MINUTES_IN_SEC)
-    recent_tweet_counts += 1 if is_tweeted_recently else 0
-    if _doesTweetContainKeywords(tweet_text, DELAYED_KEYWORDS):
-      if not _isRetweet(tweet_text) and is_tweeted_recently:
-        delayed_tweet_counts += 1
-        delayed_tweets.append('%s AT %s' % (tweet_text, tweet['created_at']))
-
-  if delayed_tweet_counts:
-    print "Found some delay tweets."
-    _writeOutData(recent_tweet_counts, delayed_tweet_counts, delayed_tweets)
-    if _shouldSendTexts(recent_tweet_counts, delayed_tweet_counts):
-      print "Sending %s texts..." % len(subscriptions)
-      message = _getNotification(recent_tweet_counts,
-                                 delayed_tweet_counts,
-                                 delayed_tweets)
-      _sendTextMessages(subscriptions, message)
   return most_recent_tweet_id
+
+def _processTwitterResults(tweets):
+  """Processes and filters tweets to determine if a text should be sent.
+  """
+  tweet_filters = [filters.filterSanitizeTweets,
+                   filters.filterOldTweets,
+                   filters.filterRetweets]
+
+  for tweet_filter in tweet_filters:
+    tweets = tweet_filter(tweets)
+
+  delayed_tweets = filters.filterKeepDelayedTweets(tweets)
+
+  _writeOutData(tweets, delayed_tweets)
+  message = _getNotification(tweets, delayed_tweets)
+  should_notify = _shouldNotify(len(tweets), len(delayed_tweets))
+  return should_notify, message
 
 def getSubscriptions():
   subscriptions = []
-  f = open(SUBSCRIPTIONS_FILENAME, "r")
+  f = open(deploy_settings.SUBSCRIPTIONS_FILENAME, "r")
   loaded_json = json.load(f)
   for entry in loaded_json['subscriptions']:
-    subscriptions.append(entry["number"])
+    subscriptions.append(entry['number'])
   return subscriptions
 
-most_recent_tweet_id = -1
-while(1):
-  subscriptions = getSubscriptions()
-  print "Polling twitter...."
-  most_recent_tweet_id = pollTwitterForDelays(most_recent_tweet_id,
-                                              subscriptions)
-  print "...Done polling."
-  time.sleep(FIFTEEN_MINUTES_IN_SEC)
-
+if __name__ == '__main__':
+  most_recent_tweet_id = -1
+  while(1):
+    subscriptions = getSubscriptions()
+    print "Polling twitter...."
+    most_recent_tweet_id = pollTwitterForDelays(most_recent_tweet_id,
+                                                subscriptions)
+    print "...Done polling."
+    time.sleep(FIFTEEN_MINUTES_IN_SEC)
